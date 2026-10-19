@@ -38,8 +38,14 @@ static u8 *const nsDbgBuf[2] = { nsContext->debugBuf[0], nsContext->debugBuf[1] 
 static u8 *const nsDbgBufEnd[2] = { nsContext->debugBuf[0] + DEBUG_BUF_SIZE, nsContext->debugBuf[1] + DEBUG_BUF_SIZE };
 static u32 *const nsDbgWhich = &nsContext->debugWhich;
 
+void __attribute__((weak)) nsLogWrite(const char *, size_t) {}
+
+void __attribute__((weak)) nsLogNewline(void) {}
+
 static void nsDbgPutc(void *, void const *src, size_t len) {
 	const char *s = src;
+	// before the full check: the network buffer stays full while no viewer drains it
+	nsLogWrite(s, len);
 	while (len) {
 		if (nsConfig->debugPtr == nsDbgBufEnd[*nsDbgWhich])
 			return;
@@ -49,6 +55,7 @@ static void nsDbgPutc(void *, void const *src, size_t len) {
 }
 
 static void nsDbgLn() {
+	nsLogNewline();
 	if (nsConfig->debugPtr == nsDbgBuf[*nsDbgWhich]) {
 		return;
 	} else if (nsConfig->debugPtr == nsDbgBufEnd[*nsDbgWhich]) {
@@ -64,6 +71,7 @@ static void nsDbgLn() {
 }
 
 static void nsDbgCpy(const char *msg) {
+	nsLogWrite(msg, strlen(msg));
 	while (*msg) {
 		if (nsConfig->debugPtr == nsDbgBufEnd[*nsDbgWhich])
 			return;
@@ -426,9 +434,11 @@ static void nsMainLoop(u32 listenPort) {
 					svcSleepThread(100000000);
 					continue;
 				}
+				nsDbgPrint("accept failed on port %"PRIu32": %d\n", listenPort, serr);
 				break;
 			}
 			nsContext->hSocket = sockfd;
+			nsDbgPrint("client connected on port %"PRIu32"\n", listenPort);
 
 			if (listenPort == NS_MENU_LISTEN_PORT) {
 				tmp = fcntl(sockfd, F_GETFL, 0);
@@ -451,10 +461,13 @@ static void nsMainLoop(u32 listenPort) {
 			} WHILE_POLL2_END
 
 			closesocket(sockfd);
+			nsDbgPrint("client disconnected from port %"PRIu32"\n", listenPort);
 		} WHILE_POLL2_END
 
 end_listen:
+		ret = errno;
 		closesocket(listen_sock);
+		nsDbgPrint("listen socket on port %"PRIu32" closed (errno %"PRId32"), retrying\n", listenPort, ret);
 		// only errors get here (wifi lost, soc reset, nwm socket failed);
 		// retrying at once spins this top-priority thread and starves the
 		// system core, so wifi can't come back

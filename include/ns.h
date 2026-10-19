@@ -10,6 +10,9 @@
 #include <stdarg.h>
 
 void nsDbgPrint2(const char *title, const char *msg);
+// SD card log tee; no-ops except in the menu payload (called with debugBufferLock held)
+void nsLogWrite(const char *s, size_t len);
+void nsLogNewline(void);
 void nsDbgPrintVerboseVABuf(const char *file_name, int line_number, const char *func_name, const char* fmt, va_list arp);
 void nsDbgPrintVerboseVA(const char *file_name, int line_number, const char *func_name, const char* fmt, va_list arp);
 void nsDbgPrintRaw(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
