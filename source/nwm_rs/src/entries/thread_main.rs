@@ -344,9 +344,9 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
         // create must set it before returning or joining them hangs forever
         #[cfg(not(feature = "o3ds"))]
         macro_rules! join_or_retry {
-            ($t:expr) => {
+            ($name:literal, $t:expr) => {
                 if let Some(t) = $t {
-                    JoinThread::create(t)
+                    JoinThread::create_named(t, c_str!($name))
                 } else {
                     ns_dbg_print!(msg, c_str!("Nwm thread create failed, retrying"));
                     set_reset_threads();
@@ -358,7 +358,7 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
 
         #[cfg(not(feature = "o3ds"))]
         let _aux1 = if core_count >= 2 {
-            Some(join_or_retry!(CreateThread::create(
+            Some(join_or_retry!("aux1", CreateThread::create(
                 Some(entries::thread_aux::thread_aux),
                 1,
                 s.stacks.aux1,
@@ -371,7 +371,7 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
 
         #[cfg(not(feature = "o3ds"))]
         let _aux2 = if core_count >= 3 {
-            Some(join_or_retry!(CreateThread::create(
+            Some(join_or_retry!("aux2", CreateThread::create(
                 Some(entries::thread_aux::thread_aux),
                 2,
                 s.stacks.aux2,
@@ -383,7 +383,7 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
         };
 
         #[cfg(not(feature = "o3ds"))]
-        let _nwm = join_or_retry!(CreateThread::create(
+        let _nwm = join_or_retry!("nwm", CreateThread::create(
             Some(match entries::thread_nwm::get_reliable_stream() {
                 entries::thread_nwm::ReliableStream::None => entries::thread_nwm::thread_nwm,
                 entries::thread_nwm::ReliableStream::KCP => entries::thread_nwm::kcp_thread_nwm,
@@ -395,7 +395,7 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
         ));
 
         #[cfg(not(feature = "o3ds"))]
-        let _screen = join_or_retry!(CreateThread::create(
+        let _screen = join_or_retry!("screen", CreateThread::create(
             Some(entries::thread_screen::thread_screen),
             0,
             s.stacks.screen,
@@ -419,7 +419,7 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
                 RP_THREAD_PRIO_MIN as s32,
                 1,
             )
-            .map(JoinThread::create)
+            .map(|t| JoinThread::create_named(t, c_str!("audio")))
         } else {
             None
         };
@@ -438,9 +438,8 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
         set_reset_threads();
     }
 
-    if use_dbg {
-        ns_dbg_print!(msg, c_str!("Nwm main loop restarted"));
-    }
+    // rare and the key marker for "did the stream restart", so always log it
+    ns_dbg_print!(msg, c_str!("Nwm main loop restarted"));
 
     Some(())
 }
@@ -478,11 +477,16 @@ extern "C" fn nwmPause(shutdown: bool) {
     unsafe { RESTART_SHUTDOWN.store(shutdown, Ordering::Release) };
     unsafe { RESTART_PENDING.store(true, Ordering::Release) };
     set_reset_threads();
-    let res = unsafe { svcWaitSynchronization(RESTART_READY_EVENT, -1) };
+    ns_dbg_print!(val, c_str!("Nwm pause requested, shutdown"), shutdown as s32);
+    // this runs on NWM's own notification thread: waiting forever on a hung
+    // restart would wedge NWM itself, so give up after a while and carry on
+    let res = unsafe { svcWaitSynchronization(RESTART_READY_EVENT, NWM_PAUSE_TIMEOUT_NS) };
     if res != 0 {
-        ns_dbg_print!(failed, c_str!("Wait restart event"), res);
+        ns_dbg_print!(failed, c_str!("Wait restart event (pause)"), res);
     }
 }
+
+const NWM_PAUSE_TIMEOUT_NS: s64 = 5_000_000_000;
 
 #[unsafe(no_mangle)]
 #[named]

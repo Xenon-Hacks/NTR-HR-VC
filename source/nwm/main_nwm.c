@@ -214,6 +214,9 @@ int setUpReturn(void) {
 u32 __apt_appid;
 u32 __system_runflags;
 
+#define NWM_POLL_TIMEOUT_MS (1000)
+#define NWM_POLL_ERR_SLEEP_NS (100000000LL)
+
 u8 nsHasPoll2 = 1;
 static s32 nwm_recv_sock = -1;
 
@@ -228,7 +231,8 @@ int nsPoll2(int s) {
 	if (nwm_recv_sock < 0) {
 		nwm_recv_sock = socket(AF_INET, SOCK_DGRAM, 0);
 		if (nwm_recv_sock < 0) {
-			showDbg("nwm socket failed: %08"PRIx32, (u32)errno);
+			// log only: a message box here blocks this real-time thread on the menu
+			nsDbgPrint("nwm socket failed: %08"PRIx32"\n", (u32)errno);
 			return -1;
 		}
 
@@ -239,7 +243,7 @@ int nsPoll2(int s) {
 
 		int ret = bind(nwm_recv_sock, (struct sockaddr *)&sai, sizeof(sai));
 		if (ret < 0) {
-			showDbg("nwm_recv_sock bind failed: %08"PRIx32, (u32)errno);
+			nsDbgPrint("nwm_recv_sock bind failed: %08"PRIx32"\n", (u32)errno);
 			nsPoll2End();
 			return -1;
 		}
@@ -255,19 +259,35 @@ int nsPoll2(int s) {
 	pi[1].fd = nwm_recv_sock;
 	pi[1].events = pi[0].events = POLLIN;
 	pi[1].revents = pi[0].revents = 0;
-	nready = poll2(pi, 2, -1);
+	// finite timeout so this top-priority thread always gets back here
+	nready = poll2(pi, 2, NWM_POLL_TIMEOUT_MS);
 	if (nready == 0)
 		return 0;
 	else if (nready < 0) {
-		showDbg("socket poll failed: %08"PRIx32, (u32)errno);
+		nsDbgPrint("socket poll failed: %08"PRIx32"\n", (u32)errno);
+		svcSleepThread(NWM_POLL_ERR_SLEEP_NS);
+		return -1;
+	}
+	// an error flag stays set, so ignoring it re-polls at once and spins
+	// this thread at top priority inside NWM, starving the Wi-Fi driver
+	if (pi[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+		nsDbgPrint("nwm_recv_sock poll error, revents %04x; recreating\n", pi[1].revents);
+		nsPoll2End();
+		svcSleepThread(NWM_POLL_ERR_SLEEP_NS);
 		return -1;
 	}
 	if (pi[1].revents & (POLLIN)) {
 		if (nsControlRecv(nwm_recv_sock) < 0) {
-			// nsDbgPrint("nsControlRecv failed\n");
+			nsDbgPrint("nsControlRecv failed; recreating nwm_recv_sock\n");
 			nsPoll2End();
+			svcSleepThread(NWM_POLL_ERR_SLEEP_NS);
 			return -1;
 		}
+	}
+	if (pi[0].revents & (POLLERR | POLLNVAL)) {
+		nsDbgPrint("control socket poll error, revents %04x\n", pi[0].revents);
+		// let accept/recv see the error and close the socket
+		return 1;
 	}
 	if (pi[0].revents & (POLLIN | POLLHUP))
 		return 1;

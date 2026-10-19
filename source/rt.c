@@ -155,6 +155,7 @@ u32 rtFlushInstructionCache(void *ptr, u32 size) {
 
 #define RT_SOCKET_WAIT_NS (50000000)
 #define RT_SOCKET_MAX_WAITS (100) // 5 s
+#define RT_SOCKET_MAX_IDLE_WAITS (200) // 10 s
 
 int rtRecvSocket(u32 sockfd, u8 *buf, int size)
 {
@@ -169,8 +170,11 @@ int rtRecvSocket(u32 sockfd, u8 *buf, int size)
 			if (ret < 0) {
 				ret = errno;
 				if (ret == EWOULDBLOCK || ret == EAGAIN) {
-					// a peer that vanished mid-packet must not hold this thread forever
-					if (pos > 0 && ++waits > RT_SOCKET_MAX_WAITS)
+					// a peer that vanished (mid-packet, or Wi-Fi gone with no
+					// FIN/RST) must not hold this thread forever; viewers send
+					// heartbeats several times a second, so long idle means dead
+					++waits;
+					if (pos > 0 ? waits > RT_SOCKET_MAX_WAITS : waits > RT_SOCKET_MAX_IDLE_WAITS)
 						return -1;
 					svcSleepThread(RT_SOCKET_WAIT_NS);
 					continue;

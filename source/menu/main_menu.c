@@ -987,6 +987,15 @@ static u32 nsLogLen;
 static u32 nsLogDropped;
 static char nsLogLastChar = '\n';
 static int nsLogReady;
+static int nsLogUrgent;
+
+static int nsLogHasWord(const char *s, size_t len, const char *w) {
+	size_t wl = strlen(w);
+	for (size_t i = 0; i + wl <= len; ++i)
+		if (memcmp(s + i, w, wl) == 0)
+			return 1;
+	return 0;
+}
 
 void nsLogWrite(const char *s, size_t len) {
 	if (!nsLogReady || !len)
@@ -1000,6 +1009,10 @@ void nsLogWrite(const char *s, size_t len) {
 		return;
 	memcpy(nsLogBuf[nsLogWhich] + nsLogLen, s, len);
 	nsLogLen += len;
+	// errors get written within 100 ms instead of 2 s, in case a freeze follows
+	if (nsLogHasWord(s, len, "fail") || nsLogHasWord(s, len, "timeout") ||
+		nsLogHasWord(s, len, "error") || nsLogHasWord(s, len, "restart"))
+		nsLogUrgent = 1;
 	nsLogLastChar = s[len - 1];
 }
 
@@ -1188,10 +1201,8 @@ void mainThread(void *) {
 	int logCnt = 0;
 	while (1) {
 		if (getKeys() == NTRMenuHotkey) {
-			if (canUseUI()) {
-				nsLogFlush(1);
+			if (canUseUI())
 				showMainMenu();
-			}
 		}
 		svcSleepThread(100000000);
 		waitCnt += 1;
@@ -1200,7 +1211,12 @@ void mainThread(void *) {
 			waitCnt = 0;
 		}
 		logCnt += 1;
+		if (nsLogUrgent && logCnt % NS_LOG_FLUSH_TICKS != 0) {
+			nsLogUrgent = 0;
+			nsLogFlush(0);
+		}
 		if (logCnt % NS_LOG_FLUSH_TICKS == 0) {
+			nsLogUrgent = 0;
 			nsLogFlush(logCnt >= NS_LOG_STAMP_TICKS);
 			if (logCnt >= NS_LOG_STAMP_TICKS)
 				logCnt = 0;

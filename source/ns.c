@@ -113,11 +113,13 @@ void nsDbgPrintVerboseVABuf(const char *file_name, int line_number, const char *
 		nsDbgLn();
 
 		if (file_name && func_name) {
+			// ticks * 1e9 overflows u64 after ~68 s of uptime; split into s and us
 			u64 ticks = svcGetSystemTick();
-			u64 mono_ns = ticks * 1000000000 / SYSCLOCK_ARM11;
+			u32 up_s = (u32)(ticks / SYSCLOCK_ARM11);
+			u32 up_us = (u32)((ticks % SYSCLOCK_ARM11) * 1000000 / SYSCLOCK_ARM11);
 			u32 pid = getCurrentProcessId();
 
-			nsDbgPrintRawInternal(DBG_VERBOSE_TITLE, (u32)(mono_ns / 1000000 % 60000), (u32)(mono_ns % 1000000), pid, file_name, line_number, func_name);
+			nsDbgPrintRawInternal(DBG_VERBOSE_TITLE, up_s, up_us, pid, file_name, line_number, func_name);
 			nsDbgPrintRawInternal(" ");
 		}
 
@@ -402,7 +404,7 @@ static void nsMainLoop(u32 listenPort) {
 
 		ret = bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr));
 		if (ret < 0) {
-			showDbg("bind failed: %08"PRIx32, (u32)errno);
+			nsDbgPrint("bind failed on port %"PRIu32": %08"PRIx32"\n", listenPort, (u32)errno);
 			goto end_listen;
 		}
 
@@ -413,7 +415,7 @@ static void nsMainLoop(u32 listenPort) {
 
 		ret = listen(listen_sock, 1);
 		if (ret < 0) {
-			showDbg("listen failed: %08"PRIx32, (u32)errno);
+			nsDbgPrint("listen failed on port %"PRIu32": %08"PRIx32"\n", listenPort, (u32)errno);
 			goto end_listen;
 		}
 
@@ -440,10 +442,11 @@ static void nsMainLoop(u32 listenPort) {
 			nsContext->hSocket = sockfd;
 			nsDbgPrint("client connected on port %"PRIu32"\n", listenPort);
 
-			if (listenPort == NS_MENU_LISTEN_PORT) {
-				tmp = fcntl(sockfd, F_GETFL, 0);
-				fcntl(sockfd, F_SETFL, tmp & ~O_NONBLOCK);
-			}
+			// keep the control socket non-blocking (it inherits that from the
+			// listen socket): a blocking recv never times out when Wi-Fi drops
+			// without a FIN/RST, and the viewer can then never reconnect
+			tmp = fcntl(sockfd, F_GETFL, 0);
+			fcntl(sockfd, F_SETFL, tmp | O_NONBLOCK);
 
 			WHILE_POLL2(sockfd) {
 				ret = rtRecvSocket(sockfd, (u8 *)&nsContext->packetBuf, sizeof(NS_PACKET));
