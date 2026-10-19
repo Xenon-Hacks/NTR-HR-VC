@@ -381,7 +381,10 @@ unsafe fn rp_audio_data_buf_malloc_base() -> Option<*mut c_char> {
         let w = &mut *AUDIO_WORK;
         wait_syn(cname!(), w.sem, c_str!("AUDIO_WORK.sem"))?;
 
-        wait_syn(cname!(), w.lock, c_str!("AUDIO_WORK.lock"))?;
+        if wait_syn(cname!(), w.lock, c_str!("AUDIO_WORK.lock")).is_none() {
+            release_sem(cname!(), w.sem, c_str!("AUDIO_WORK.sem"));
+            return None;
+        }
 
         let dst = mp_malloc(&mut w.pool) as *mut u8;
 
@@ -411,6 +414,7 @@ unsafe fn rp_audio_data_buf_free_base(dst: *const ::libc::c_char) -> bool {
 
         if mp_free(&mut w.pool, dst as *mut _) < 0 {
             ns_dbg_print!(msg, c_str!("Mem pool audio free failed"));
+            release_mutex(cname!(), w.lock, c_str!("AUDIO_WORK.lock"));
             return false;
         };
 

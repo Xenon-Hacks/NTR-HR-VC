@@ -28,6 +28,8 @@ static mut RESTART_PENDING: AtomicBool = const_default();
 static mut RESTART_READY_EVENT: Handle = const_default();
 static mut RESTART_DONE_EVENT: Handle = const_default();
 
+const RESTART_RETRY_NS: DurationNs = DurationNs::init(1_000_000_000);
+
 #[cfg(not(feature = "o3ds"))]
 pub const NWM_BUFFER_SIZE: usize =
     (SEND_BUFS_SIZE / WORK_COUNT) as usize / mem::size_of::<usize>() * mem::size_of::<usize>();
@@ -177,7 +179,11 @@ impl Init {
         #[cfg(not(feature = "o3ds"))]
         unsafe {
             init_syn_handles(vars.core_count)?;
-            entries::thread_nwm::init_seg_mem_handles(vars.qos)?;
+            if entries::thread_nwm::init_seg_mem_handles(vars.qos).is_none() {
+                // init is retried now, so don't leak a set of handles each time
+                cleanup_syn_handles(vars.core_count);
+                return None;
+            }
         }
 
         #[cfg(not(feature = "o3ds"))]
@@ -317,43 +323,67 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
 
     let use_dbg = unsafe { (*config_consts::NTR_CONFIG).ex.nsUseDbg != 0 };
 
-    let init = init(
+    // a failed init or thread create must not end the main loop for good
+    // (that stops streaming until reboot); back off and try again instead
+    let init = if let Some(init) = init(
         #[cfg(not(feature = "o3ds"))]
         &s.nwm_bufs,
-    )?;
+    ) {
+        init
+    } else {
+        ns_dbg_print!(msg, c_str!("Nwm init failed, retrying"));
+        sleep_thread(RESTART_RETRY_NS);
+        return Some(());
+    };
     #[cfg(feature = "o3ds")]
     let _ = init;
     #[cfg(not(feature = "o3ds"))]
     let core_count = init.vars.core_count.get();
     {
+        // threads already started only exit once reset is set, so a failed
+        // create must set it before returning or joining them hangs forever
+        #[cfg(not(feature = "o3ds"))]
+        macro_rules! join_or_retry {
+            ($t:expr) => {
+                if let Some(t) = $t {
+                    JoinThread::create(t)
+                } else {
+                    ns_dbg_print!(msg, c_str!("Nwm thread create failed, retrying"));
+                    set_reset_threads();
+                    sleep_thread(RESTART_RETRY_NS);
+                    return Some(());
+                }
+            };
+        }
+
         #[cfg(not(feature = "o3ds"))]
         let _aux1 = if core_count >= 2 {
-            Some(JoinThread::create(CreateThread::create(
+            Some(join_or_retry!(CreateThread::create(
                 Some(entries::thread_aux::thread_aux),
                 1,
                 s.stacks.aux1,
                 init.vars.thread_prio as i32,
                 3,
-            )?))
+            )))
         } else {
             None
         };
 
         #[cfg(not(feature = "o3ds"))]
         let _aux2 = if core_count >= 3 {
-            Some(JoinThread::create(CreateThread::create(
+            Some(join_or_retry!(CreateThread::create(
                 Some(entries::thread_aux::thread_aux),
                 2,
                 s.stacks.aux2,
                 RP_THREAD_PRIO_MAX as s32,
                 1,
-            )?))
+            )))
         } else {
             None
         };
 
         #[cfg(not(feature = "o3ds"))]
-        let _nwm = JoinThread::create(CreateThread::create(
+        let _nwm = join_or_retry!(CreateThread::create(
             Some(match entries::thread_nwm::get_reliable_stream() {
                 entries::thread_nwm::ReliableStream::None => entries::thread_nwm::thread_nwm,
                 entries::thread_nwm::ReliableStream::KCP => entries::thread_nwm::kcp_thread_nwm,
@@ -362,16 +392,16 @@ fn main(_impl_: Impl, #[cfg(not(feature = "o3ds"))] s: &mut ThreadsStorage) -> O
             s.stacks.nwm,
             RP_THREAD_PRIO_MIN as s32,
             RP_CORE_ID_MAIN,
-        )?);
+        ));
 
         #[cfg(not(feature = "o3ds"))]
-        let _screen = JoinThread::create(CreateThread::create(
+        let _screen = join_or_retry!(CreateThread::create(
             Some(entries::thread_screen::thread_screen),
             0,
             s.stacks.screen,
             RP_THREAD_PRIO_MIN as s32,
             RP_CORE_ID_MAIN,
-        )?);
+        ));
 
         // NTR-HR+ audio capture thread (opt-in via RP_CONFIG.audioEnable),
         // high priority so every dsp frame is captured

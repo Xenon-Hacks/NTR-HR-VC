@@ -373,6 +373,8 @@ int __attribute__((weak)) nsPoll2(int) {
 
 void __attribute__((weak)) nsPoll2End() {}
 
+#define NS_RETRY_SLEEP_NS (500000000LL)
+
 static void nsMainLoop(u32 listenPort) {
 	while (1) {
 		s32 listen_sock, ret, tmp, sockfd;
@@ -453,6 +455,10 @@ static void nsMainLoop(u32 listenPort) {
 
 end_listen:
 		closesocket(listen_sock);
+		// only errors get here (wifi lost, soc reset, nwm socket failed);
+		// retrying at once spins this top-priority thread and starves the
+		// system core, so wifi can't come back
+		svcSleepThread(NS_RETRY_SLEEP_NS);
 	}
 
 	nsPoll2End();
