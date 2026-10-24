@@ -194,19 +194,34 @@ impl<'a> Drop for CreateThread<'a> {
 }
 
 #[allow(unused)]
-pub struct JoinThread<'a>(CreateThread<'a>);
+pub struct JoinThread<'a>(CreateThread<'a>, *const c_char);
 
 impl<'a> JoinThread<'a> {
     #[allow(unused)]
     pub fn create(t: CreateThread<'a>) -> Self {
-        Self(t)
+        Self(t, c_str!("rp"))
+    }
+
+    #[allow(unused)]
+    pub fn create_named(t: CreateThread<'a>, name: *const c_char) -> Self {
+        Self(t, name)
     }
 }
 
+const JOIN_WATCHDOG_NS: s64 = 3_000_000_000;
+
 impl<'a> Drop for JoinThread<'a> {
+    #[named]
     fn drop(&mut self) {
         unsafe {
-            let _ = svcWaitSynchronization(self.0.0, -1);
+            // still have to wait for it (its stack is reused), but name a
+            // thread that hangs a restart so the SD log shows which one
+            if svcWaitSynchronization(self.0.0, JOIN_WATCHDOG_NS) != 0 {
+                ns_dbg_print!(msg, self.1);
+                ns_dbg_print!(msg, c_str!("^ thread not exited 3 s after reset, still waiting"));
+                let _ = svcWaitSynchronization(self.0.0, -1);
+                ns_dbg_print!(msg, c_str!("thread exited after watchdog warning"));
+            }
         }
     }
 }

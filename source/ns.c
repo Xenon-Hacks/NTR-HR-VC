@@ -38,8 +38,14 @@ static u8 *const nsDbgBuf[2] = { nsContext->debugBuf[0], nsContext->debugBuf[1] 
 static u8 *const nsDbgBufEnd[2] = { nsContext->debugBuf[0] + DEBUG_BUF_SIZE, nsContext->debugBuf[1] + DEBUG_BUF_SIZE };
 static u32 *const nsDbgWhich = &nsContext->debugWhich;
 
+void __attribute__((weak)) nsLogWrite(const char *, size_t) {}
+
+void __attribute__((weak)) nsLogNewline(void) {}
+
 static void nsDbgPutc(void *, void const *src, size_t len) {
 	const char *s = src;
+	// before the full check: the network buffer stays full while no viewer drains it
+	nsLogWrite(s, len);
 	while (len) {
 		if (nsConfig->debugPtr == nsDbgBufEnd[*nsDbgWhich])
 			return;
@@ -49,6 +55,7 @@ static void nsDbgPutc(void *, void const *src, size_t len) {
 }
 
 static void nsDbgLn() {
+	nsLogNewline();
 	if (nsConfig->debugPtr == nsDbgBuf[*nsDbgWhich]) {
 		return;
 	} else if (nsConfig->debugPtr == nsDbgBufEnd[*nsDbgWhich]) {
@@ -64,6 +71,7 @@ static void nsDbgLn() {
 }
 
 static void nsDbgCpy(const char *msg) {
+	nsLogWrite(msg, strlen(msg));
 	while (*msg) {
 		if (nsConfig->debugPtr == nsDbgBufEnd[*nsDbgWhich])
 			return;
@@ -105,11 +113,13 @@ void nsDbgPrintVerboseVABuf(const char *file_name, int line_number, const char *
 		nsDbgLn();
 
 		if (file_name && func_name) {
+			// ticks * 1e9 overflows u64 after ~68 s of uptime; split into s and us
 			u64 ticks = svcGetSystemTick();
-			u64 mono_ns = ticks * 1000000000 / SYSCLOCK_ARM11;
+			u32 up_s = (u32)(ticks / SYSCLOCK_ARM11);
+			u32 up_us = (u32)((ticks % SYSCLOCK_ARM11) * 1000000 / SYSCLOCK_ARM11);
 			u32 pid = getCurrentProcessId();
 
-			nsDbgPrintRawInternal(DBG_VERBOSE_TITLE, (u32)(mono_ns / 1000000 % 60000), (u32)(mono_ns % 1000000), pid, file_name, line_number, func_name);
+			nsDbgPrintRawInternal(DBG_VERBOSE_TITLE, up_s, up_us, pid, file_name, line_number, func_name);
 			nsDbgPrintRawInternal(" ");
 		}
 
@@ -373,6 +383,8 @@ int __attribute__((weak)) nsPoll2(int) {
 
 void __attribute__((weak)) nsPoll2End() {}
 
+#define NS_RETRY_SLEEP_NS (500000000LL)
+
 static void nsMainLoop(u32 listenPort) {
 	while (1) {
 		s32 listen_sock, ret, tmp, sockfd;
@@ -392,7 +404,7 @@ static void nsMainLoop(u32 listenPort) {
 
 		ret = bind(listen_sock, (struct sockaddr *)&addr, sizeof(addr));
 		if (ret < 0) {
-			showDbg("bind failed: %08"PRIx32, (u32)errno);
+			nsDbgPrint("bind failed on port %"PRIu32": %08"PRIx32"\n", listenPort, (u32)errno);
 			goto end_listen;
 		}
 
@@ -403,7 +415,7 @@ static void nsMainLoop(u32 listenPort) {
 
 		ret = listen(listen_sock, 1);
 		if (ret < 0) {
-			showDbg("listen failed: %08"PRIx32, (u32)errno);
+			nsDbgPrint("listen failed on port %"PRIu32": %08"PRIx32"\n", listenPort, (u32)errno);
 			goto end_listen;
 		}
 
@@ -424,14 +436,17 @@ static void nsMainLoop(u32 listenPort) {
 					svcSleepThread(100000000);
 					continue;
 				}
+				nsDbgPrint("accept failed on port %"PRIu32": %d\n", listenPort, serr);
 				break;
 			}
 			nsContext->hSocket = sockfd;
+			nsDbgPrint("client connected on port %"PRIu32"\n", listenPort);
 
-			if (listenPort == NS_MENU_LISTEN_PORT) {
-				tmp = fcntl(sockfd, F_GETFL, 0);
-				fcntl(sockfd, F_SETFL, tmp & ~O_NONBLOCK);
-			}
+			// keep the control socket non-blocking (it inherits that from the
+			// listen socket): a blocking recv never times out when Wi-Fi drops
+			// without a FIN/RST, and the viewer can then never reconnect
+			tmp = fcntl(sockfd, F_GETFL, 0);
+			fcntl(sockfd, F_SETFL, tmp | O_NONBLOCK);
 
 			WHILE_POLL2(sockfd) {
 				ret = rtRecvSocket(sockfd, (u8 *)&nsContext->packetBuf, sizeof(NS_PACKET));
@@ -449,10 +464,17 @@ static void nsMainLoop(u32 listenPort) {
 			} WHILE_POLL2_END
 
 			closesocket(sockfd);
+			nsDbgPrint("client disconnected from port %"PRIu32"\n", listenPort);
 		} WHILE_POLL2_END
 
 end_listen:
+		ret = errno;
 		closesocket(listen_sock);
+		nsDbgPrint("listen socket on port %"PRIu32" closed (errno %"PRId32"), retrying\n", listenPort, ret);
+		// only errors get here (wifi lost, soc reset, nwm socket failed);
+		// retrying at once spins this top-priority thread and starves the
+		// system core, so wifi can't come back
+		svcSleepThread(NS_RETRY_SLEEP_NS);
 	}
 
 	nsPoll2End();

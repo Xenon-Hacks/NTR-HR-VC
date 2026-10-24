@@ -153,10 +153,15 @@ u32 rtFlushInstructionCache(void *ptr, u32 size) {
 	return svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)ptr, size);
 }
 
+#define RT_SOCKET_WAIT_NS (50000000)
+#define RT_SOCKET_MAX_WAITS (100) // 5 s
+#define RT_SOCKET_MAX_IDLE_WAITS (200) // 10 s
+
 int rtRecvSocket(u32 sockfd, u8 *buf, int size)
 {
 	int ret, pos = 0;
 	int tmpsize = size;
+	int waits = 0;
 
 	while(tmpsize)
 	{
@@ -165,7 +170,13 @@ int rtRecvSocket(u32 sockfd, u8 *buf, int size)
 			if (ret < 0) {
 				ret = errno;
 				if (ret == EWOULDBLOCK || ret == EAGAIN) {
-					svcSleepThread(50000000);
+					// a peer that vanished (mid-packet, or Wi-Fi gone with no
+					// FIN/RST) must not hold this thread forever; viewers send
+					// heartbeats several times a second, so long idle means dead
+					++waits;
+					if (pos > 0 ? waits > RT_SOCKET_MAX_WAITS : waits > RT_SOCKET_MAX_IDLE_WAITS)
+						return -1;
+					svcSleepThread(RT_SOCKET_WAIT_NS);
 					continue;
 				}
 				return -1;
@@ -183,6 +194,7 @@ int rtSendSocket(u32 sockfd, u8 *buf, int size)
 {
 	int ret, pos = 0;
 	int tmpsize = size;
+	int waits = 0;
 
 	while(tmpsize)
 	{
@@ -190,7 +202,10 @@ int rtSendSocket(u32 sockfd, u8 *buf, int size)
 		{
 			ret = errno;
 			if (ret == EWOULDBLOCK || ret == EAGAIN) {
-				svcSleepThread(50000000);
+				// a send buffer that never drains (link gone) must not hold this thread forever
+				if (++waits > RT_SOCKET_MAX_WAITS)
+					return -1;
+				svcSleepThread(RT_SOCKET_WAIT_NS);
 				continue;
 			}
 			return -1;

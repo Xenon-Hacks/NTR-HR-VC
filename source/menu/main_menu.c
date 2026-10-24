@@ -970,6 +970,148 @@ final:
 	return;
 }
 
+// SD card log: every debug line also goes to /ntr-hr-log.txt, so a stall
+// that takes the network down still leaves a trail (the viewer only gets
+// lines while it is connected). Lines are buffered under debugBufferLock and
+// written from the menu main loop; a wall-clock stamp is added each minute.
+#define NS_LOG_BUF_SIZE (0x2000)
+#define NS_LOG_FILE "/ntr-hr-log.txt"
+#define NS_LOG_OLD_FILE "/ntr-hr-log.old.txt"
+#define NS_LOG_MAX_FILE_SIZE (0x100000)
+#define NS_LOG_FLUSH_TICKS (20) // main loop ticks of 100 ms
+#define NS_LOG_STAMP_TICKS (600)
+
+static char *nsLogBuf[2];
+static u32 nsLogWhich;
+static u32 nsLogLen;
+static u32 nsLogDropped;
+static char nsLogLastChar = '\n';
+static int nsLogReady;
+static int nsLogUrgent;
+
+static int nsLogHasWord(const char *s, size_t len, const char *w) {
+	size_t wl = strlen(w);
+	for (size_t i = 0; i + wl <= len; ++i)
+		if (memcmp(s + i, w, wl) == 0)
+			return 1;
+	return 0;
+}
+
+void nsLogWrite(const char *s, size_t len) {
+	if (!nsLogReady || !len)
+		return;
+	u32 room = NS_LOG_BUF_SIZE - nsLogLen;
+	if (len > room) {
+		nsLogDropped += len - room;
+		len = room;
+	}
+	if (!len)
+		return;
+	memcpy(nsLogBuf[nsLogWhich] + nsLogLen, s, len);
+	nsLogLen += len;
+	// errors get written within 100 ms instead of 2 s, in case a freeze follows
+	if (nsLogHasWord(s, len, "fail") || nsLogHasWord(s, len, "timeout") ||
+		nsLogHasWord(s, len, "error") || nsLogHasWord(s, len, "restart"))
+		nsLogUrgent = 1;
+	nsLogLastChar = s[len - 1];
+}
+
+void nsLogNewline(void) {
+	if (nsLogLastChar != '\n')
+		nsLogWrite("\n", 1);
+}
+
+static void nsLogFormatTime(char *out, u32 size) {
+	// osGetTime is ms since 1900-01-01
+	u64 ms = osGetTime();
+	u32 secs = (u32)(ms / 1000 % 86400);
+	s32 z = (s32)(ms / 1000 / 86400) - 25567 + 719468; // days since 0000-03-01
+	s32 era = z / 146097;
+	u32 doe = (u32)(z - era * 146097);
+	u32 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	u32 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	u32 mp = (5 * doy + 2) / 153;
+	u32 d = doy - (153 * mp + 2) / 5 + 1;
+	u32 m = mp < 10 ? mp + 3 : mp - 9;
+	u32 y = yoe + era * 400 + (m <= 2);
+	u64 up_ms = svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000);
+	xsnprintf(out, size, "@ %04"PRIu32"-%02"PRIu32"-%02"PRIu32" %02"PRIu32":%02"PRIu32":%02"PRIu32" (up %"PRIu32" s)\n",
+		y, m, d, secs / 3600, secs / 60 % 60, secs % 60, (u32)(up_ms / 1000));
+}
+
+static void nsLogAppendFile(const char *data, u32 len) {
+	Handle file;
+	Result res = FSUSER_OpenFileDirectly(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, NULL),
+		fsMakePath(PATH_ASCII, NS_LOG_FILE), FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
+	if (res != 0)
+		return;
+
+	u64 size = 0;
+	FSFILE_GetSize(file, &size);
+	if (size > NS_LOG_MAX_FILE_SIZE) {
+		FSFILE_Close(file);
+		FS_Archive sdmc;
+		if (FSUSER_OpenArchive(&sdmc, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, NULL)) == 0) {
+			FSUSER_DeleteFile(sdmc, fsMakePath(PATH_ASCII, NS_LOG_OLD_FILE));
+			FSUSER_RenameFile(sdmc, fsMakePath(PATH_ASCII, NS_LOG_FILE), sdmc, fsMakePath(PATH_ASCII, NS_LOG_OLD_FILE));
+			FSUSER_CloseArchive(sdmc);
+		}
+		res = FSUSER_OpenFileDirectly(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, NULL),
+			fsMakePath(PATH_ASCII, NS_LOG_FILE), FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
+		if (res != 0)
+			return;
+		size = 0;
+		FSFILE_GetSize(file, &size);
+	}
+
+	u32 written;
+	FSFILE_Write(file, &written, size, data, len, FS_WRITE_FLUSH);
+	FSFILE_Close(file);
+}
+
+static void nsLogFlush(int stamp) {
+	if (!nsLogReady)
+		return;
+
+	char line[96];
+	if (stamp) {
+		nsLogFormatTime(line, sizeof(line));
+		rtAcquireLock(&nsConfig->debugBufferLock);
+		nsLogNewline();
+		nsLogWrite(line, strlen(line));
+		rtReleaseLock(&nsConfig->debugBufferLock);
+	}
+
+	rtAcquireLock(&nsConfig->debugBufferLock);
+	char *buf = nsLogBuf[nsLogWhich];
+	u32 len = nsLogLen;
+	u32 dropped = nsLogDropped;
+	nsLogWhich ^= 1;
+	nsLogLen = 0;
+	nsLogDropped = 0;
+	rtReleaseLock(&nsConfig->debugBufferLock);
+
+	if (len)
+		nsLogAppendFile(buf, len);
+	if (dropped) {
+		xsnprintf(line, sizeof(line), "\n(log buffer full, %"PRIu32" bytes dropped)\n", dropped);
+		nsLogAppendFile(line, strlen(line));
+	}
+}
+
+static void nsLogInit(void) {
+	nsLogBuf[0] = (char *)plgRequestMemory(NS_LOG_BUF_SIZE * 2);
+	if (!nsLogBuf[0])
+		return;
+	nsLogBuf[1] = nsLogBuf[0] + NS_LOG_BUF_SIZE;
+
+	char line[96];
+	nsLogFormatTime(line, sizeof(line));
+	nsLogAppendFile("\n=== NTR-HR started ", 20);
+	nsLogAppendFile(line + 2, strlen(line + 2));
+	nsLogReady = 1;
+}
+
 void __system_initSyscalls(void);
 Result __sync_init(void);
 void mainThread(void *) {
@@ -1008,6 +1150,8 @@ void mainThread(void *) {
 	} else {
 		fsUseSession(fsUserHandle);
 	}
+
+	nsLogInit();
 
 	if (!ntrConfig->memMode) {
 		ret = loadPayloadBin(NTR_BIN_PM);
@@ -1054,6 +1198,7 @@ void mainThread(void *) {
 	menuNotificationHook();
 
 	int waitCnt = 0;
+	int logCnt = 0;
 	while (1) {
 		if (getKeys() == NTRMenuHotkey) {
 			if (canUseUI())
@@ -1064,6 +1209,17 @@ void mainThread(void *) {
 		if (waitCnt % 8 == 0) {
 			lockCpuClock();
 			waitCnt = 0;
+		}
+		logCnt += 1;
+		if (nsLogUrgent && logCnt % NS_LOG_FLUSH_TICKS != 0) {
+			nsLogUrgent = 0;
+			nsLogFlush(0);
+		}
+		if (logCnt % NS_LOG_FLUSH_TICKS == 0) {
+			nsLogUrgent = 0;
+			nsLogFlush(logCnt >= NS_LOG_STAMP_TICKS);
+			if (logCnt >= NS_LOG_STAMP_TICKS)
+				logCnt = 0;
 		}
 	}
 

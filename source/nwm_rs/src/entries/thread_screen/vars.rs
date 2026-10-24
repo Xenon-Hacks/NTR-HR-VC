@@ -526,17 +526,22 @@ impl Screen<'_> {
 
 #[cfg(not(feature = "o3ds"))]
 pub fn wait_for_vblank(is_top: bool) {
+    // bounded: a missed VBlank relay must not keep this thread from seeing
+    // a stream reset (the restart then waits on it forever)
     unsafe {
-        gspWaitForEvent(
+        let _ = gspWaitForEventTimeout(
             if is_top {
                 GSPGPU_EVENT_VBlank0
             } else {
                 GSPGPU_EVENT_VBlank1
             },
             false,
+            VBLANK_WAIT_TIMEOUT_NS,
         );
     }
 }
+
+const VBLANK_WAIT_TIMEOUT_NS: s64 = 100_000_000;
 
 #[derive(ConstDefault, Clone, Copy)]
 pub struct ScreenInfo {
