@@ -1,0 +1,47 @@
+From 030623e865fcbb436b1e385ba9b56c3fe2fce3fa Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 19 Oct 2026 00:43:16 -0400
+Subject: [PATCH] Add gspWaitForEventTimeout
+
+---
+ libctru/include/3ds/services/gspgpu.h | 3 +++
+ libctru/source/services/gspgpu.c      | 9 +++++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/libctru/include/3ds/services/gspgpu.h b/libctru/include/3ds/services/gspgpu.h
+index 947088d..d252683 100644
+--- a/libctru/include/3ds/services/gspgpu.h
++++ b/libctru/include/3ds/services/gspgpu.h
+@@ -156,6 +156,9 @@ void gspSetEventCallback(GSPGPU_Event id, ThreadFunc cb, void* data, bool oneSho
+  */
+ void gspWaitForEvent(GSPGPU_Event id, bool nextEvent);
+ 
++/// Like gspWaitForEvent, but gives up after timeout_ns. Returns 0 if the event fired.
++int gspWaitForEventTimeout(GSPGPU_Event id, bool nextEvent, s64 timeout_ns);
++
+ /**
+  * @brief Waits for any GSPGPU event to occur.
+  * @return The ID of the event that occurred.
+diff --git a/libctru/source/services/gspgpu.c b/libctru/source/services/gspgpu.c
+index d055850..37f596e 100644
+--- a/libctru/source/services/gspgpu.c
++++ b/libctru/source/services/gspgpu.c
+@@ -299,6 +299,15 @@ void gspWaitForEvent(GSPGPU_Event id, bool nextEvent)
+ 	LightEvent_Wait(&gspEvents[id]);
+ }
+ 
++int gspWaitForEventTimeout(GSPGPU_Event id, bool nextEvent, s64 timeout_ns)
++{
++	if(id>= GSPGPU_EVENT_MAX)return -1;
++
++	if (nextEvent)
++		LightEvent_Clear(&gspEvents[id]);
++	return LightEvent_WaitTimeout(&gspEvents[id], timeout_ns);
++}
++
+ GSPGPU_Event gspWaitForAnyEvent(void)
+ {
+ 	s32 x;
+-- 
+2.55.0.windows.5
+
